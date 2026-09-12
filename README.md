@@ -11,7 +11,7 @@ Zero external Python dependencies — just needs the standard Kali tools install
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USER/huskyrecon.git
+git clone https://github.com/TheHuskyHacker/husky-recon
 cd huskyrecon
 chmod +x huskyrecon.py
 sudo ln -s $(pwd)/huskyrecon.py /usr/local/bin/huskyrecon
