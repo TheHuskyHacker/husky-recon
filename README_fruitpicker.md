@@ -9,7 +9,7 @@ Requires: `requests` (pip install requests). Optional tools: nmap, smbclient, rp
 ## Install
 
 ```bash
-git clone https://github.com/YOUR_USER/huskytools.git
+git clone https://github.com/TheHuskyHacker/husky-recon
 cd huskytools
 pip install requests
 chmod +x fruitpicker.py
