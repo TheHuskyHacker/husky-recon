@@ -1,44 +1,52 @@
 # Husky Recon — Auto-Recon Pipeline
 
-Full initial enumeration on autopilot. Takes a target IP, discovers ports, branches into service-specific enumeration in parallel, organizes everything into clean folders, and flags quick wins at the end.
+Automated initial enumeration pipeline. Takes a target IP, runs a full nmap port scan with service detection, then kicks off parallel service-specific enumeration — web, SMB, SNMP, FTP, DNS, LDAP — organizes output into clean folders, and flags quick wins at the end.
 
-Stop typing the same nmap → gobuster → enum4linux dance at the start of every box.
+Uses `python-nmap` for reliable port scanning. No more subprocess parsing issues.
 
-Zero external Python dependencies — just needs the standard Kali tools installed.
+**Part of the [Husky Hacker](https://medium.com/@TheHuskyHacker) toolkit.**
 
 ---
 
 ## Install
 
 ```bash
+# Required
+sudo pip install python-nmap --break-system-packages
+
+# Clone
 git clone https://github.com/TheHuskyHacker/husky-recon
-cd huskyrecon
+cd husky-recon
 chmod +x huskyrecon.py
-sudo ln -s $(pwd)/huskyrecon.py /usr/local/bin/huskyrecon
 ```
+
+**Important:** Use `sudo pip` — the script runs with sudo for SYN scans, and root's Python needs to see the package.
 
 ---
 
 ## Usage
 
 ```bash
-# Full auto — just give it a target
-sudo huskyrecon 10.10.10.5
-
-# Specify domain for DNS zone transfers
-sudo huskyrecon 10.10.10.5 -d corp.local
+# Standard full recon
+sudo python3 huskyrecon.py 10.10.10.5
 
 # Custom output directory
-sudo huskyrecon 10.10.10.5 -o ./loot/box1
+sudo python3 huskyrecon.py 10.10.10.5 -o ./loot/target1
 
-# Custom wordlist for web scanning
-sudo huskyrecon 10.10.10.5 -w /usr/share/seclists/Discovery/Web-Content/big.txt
+# With domain for DNS zone transfers
+sudo python3 huskyrecon.py 10.10.10.5 -d corp.local
 
-# Quick scan only (skip full 65535 + UDP + vuln scripts)
-sudo huskyrecon 10.10.10.5 --skip-full --skip-udp --skip-vuln
+# Custom wordlist for web directories
+sudo python3 huskyrecon.py 10.10.10.5 -w /usr/share/seclists/Discovery/Web-Content/big.txt
 
-# More parallel threads for service scans
-sudo huskyrecon 10.10.10.5 --threads 8
+# Skip slow scans
+sudo python3 huskyrecon.py 10.10.10.5 --skip-vuln --skip-udp
+
+# More parallel threads
+sudo python3 huskyrecon.py 10.10.10.5 --threads 8
+
+# Force continue even if no ports found
+sudo python3 huskyrecon.py 10.10.10.5 --force
 ```
 
 ---
@@ -46,82 +54,82 @@ sudo huskyrecon 10.10.10.5 --threads 8
 ## What It Does
 
 ### Phase 1: Port Discovery
-- **Quick nmap** — top 1000 TCP ports with service/version detection and default scripts
-- **Full TCP** — all 65535 ports (runs in background while service scans start)
-- **UDP** — top 50 UDP ports (runs in background)
+Scans all 65535 TCP ports with service detection using python-nmap:
+- `-sC -sV -Pn -p- --open --min-rate 1000`
+- If no ports found, auto-runs a second full scan as fallback
+- UDP top 50 ports in background
+- Flags quick wins immediately (FTP anon, web server versions)
 
-### Phase 2: Service Enumeration (parallel)
+### Phase 2: Service Enumeration (Parallel)
+Based on discovered ports, runs service-specific checks in parallel:
 
-Automatically branches based on discovered services:
-
-| Port/Service | What It Runs |
-|---|---|
-| **HTTP/HTTPS** (80, 443, 8080, etc.) | whatweb fingerprint, gobuster dir scan (php/html/txt/asp/jsp/bak extensions), nikto, header grab |
-| **SMB** (139, 445) | smbclient null/guest share listing, enum4linux-ng, crackmapexec/netexec fingerprint, rpcclient null session |
-| **FTP** (21) | Anonymous login test, directory listing |
-| **DNS** (53) | Reverse lookup, zone transfer attempt, version query |
-| **SNMP** (161) | snmpwalk with public/private/community/manager, extended OID walks (processes, software, users, TCP ports), snmp-check |
-| **LDAP** (389, 636) | Anonymous bind check, base DN extraction, full dump |
+| Service | Port(s) | What It Runs |
+|---|---|---|
+| **HTTP/HTTPS** | 80, 443, 8080+ | whatweb, gobuster (dir + extensions), nikto, header grab |
+| **SMB** | 139, 445 | smbclient null/guest, enum4linux-ng, crackmapexec, rpcclient |
+| **FTP** | 21 | Anonymous login test, file listing |
+| **SNMP** | 161 (UDP) | Community string check (public/private/community/manager), extended OID walks |
+| **DNS** | 53 | Reverse lookup, zone transfer, version query |
+| **LDAP** | 389, 636 | Anonymous bind check, base DN extraction, full dump |
 
 ### Phase 3: Vulnerability Scripts
-- nmap `--script vuln` against all discovered ports
-- Flags any CVE hits as quick wins
+Runs `nmap --script vuln` against all discovered ports and flags CVEs.
 
-### Output
-Everything organized into:
+---
+
+## Output Structure
+
 ```
 ./recon/10.10.10.5/
-  nmap/
-    quick_tcp.txt
-    full_tcp.txt
-    udp.txt
-    vuln.txt
-  web/
-    http_80/
-      whatweb.txt
-      gobuster_dir.txt
-      nikto.txt
-      headers.txt
-    https_443/
-      ...
-  smb/
-    shares_null.txt
-    shares_guest.txt
-    enum4linux.txt
-    cme_smb.txt
-    rpcclient_null.txt
-  ftp/
-    anon_login.txt
-  dns/
-    axfr_domain.txt
-    version.txt
-  snmp/
-    snmpwalk_public.txt
-    snmp_processes.txt
-    snmp_users.txt
-  ldap/
-    anonymous.txt
-    full_dump.txt
-  SUMMARY.txt
+├── nmap/
+│   ├── quick_tcp.txt        Full TCP scan results
+│   ├── full_tcp.txt         Background full scan
+│   ├── udp.txt              UDP top 50
+│   └── vuln.txt             Vulnerability scripts
+├── web/
+│   ├── http_80/
+│   │   ├── whatweb.txt      Technology fingerprint
+│   │   ├── gobuster_dir.txt Directory scan
+│   │   ├── nikto.txt        Vulnerability scan
+│   │   └── headers.txt      HTTP headers
+│   └── https_443/
+├── smb/
+│   ├── shares_null.txt      Null session shares
+│   ├── shares_guest.txt     Guest session shares
+│   ├── enum4linux.txt       Full SMB enum
+│   ├── cme_smb.txt          CrackMapExec fingerprint
+│   └── rpcclient_null.txt   RPC null session
+├── snmp/
+│   ├── snmpwalk_public.txt  Community string walk
+│   ├── snmp_users.txt       User enumeration
+│   ├── snmp_processes.txt   Running processes
+│   └── snmp-check.txt       Full SNMP dump
+├── ftp/
+│   └── anon_login.txt       Anonymous login test
+├── dns/
+│   ├── axfr_domain.txt      Zone transfer attempt
+│   └── version.txt          DNS version
+├── ldap/
+│   ├── anonymous.txt        Anonymous bind
+│   └── full_dump.txt        Full LDAP dump
+└── SUMMARY.txt              Quick reference with all findings
 ```
 
 ---
 
 ## Quick Wins
 
-The tool automatically flags these during the scan:
+The script flags high-value findings as they're discovered:
 
-- FTP anonymous access
-- SMB null/guest sessions
-- RPC null session (user enumeration)
-- SNMP valid community strings
-- DNS zone transfer success
-- LDAP anonymous bind
-- Web server version disclosure
-- Nmap vuln script CVE hits
-- Interesting web paths (admin, upload, login, .env, wp-config, etc.)
-
-All quick wins are collected and printed at the end, plus saved to `SUMMARY.txt`.
+```
+[!!!] FTP Anonymous login successful on port 21!
+[!!!] SMB null session — shares listed!
+[!!!] SNMP community 'public' is valid!
+[!!!] LDAP anonymous bind successful!
+[!!!] RPC null session — domain users enumerated!
+[!!!] Interesting web path on 80: /admin
+[!!!] Vuln on 445: smb-vuln-ms17-010
+```
 
 ---
 
@@ -131,23 +139,50 @@ All quick wins are collected and printed at the end, plus saved to `SUMMARY.txt`
 |---|---|---|
 | `target` | Target IP address | required |
 | `-o, --output` | Output directory | `./recon/<target>` |
-| `-d, --domain` | Domain for DNS zone transfers | auto-detected from PTR |
-| `-w, --wordlist` | Custom gobuster wordlist | common.txt / dirb |
+| `-d, --domain` | Domain for DNS zone transfers | auto-detect |
+| `-w, --wordlist` | Custom web directory wordlist | common.txt |
 | `--threads` | Parallel service scan threads | 4 |
-| `--skip-full` | Skip full 65535-port TCP scan | off |
+| `--skip-full` | Skip background full TCP scan | off |
 | `--skip-udp` | Skip UDP scan | off |
 | `--skip-vuln` | Skip nmap vuln scripts | off |
-| `--force` | Continue even with no open ports | off |
+| `--force` | Continue if no ports found | off |
 
 ---
 
-## Tool Dependencies
+## Optional Tools
 
-Only `nmap` is required. Everything else is optional and skipped gracefully:
+Skips gracefully if missing — all pre-installed on Kali:
 
-**Required:** nmap
+| Tool | What For | Install |
+|---|---|---|
+| gobuster | Directory scanning | `sudo apt install gobuster` |
+| whatweb | Tech fingerprinting | `sudo apt install whatweb` |
+| nikto | Web vuln scanning | `sudo apt install nikto` |
+| enum4linux-ng | SMB enumeration | `sudo apt install enum4linux` |
+| smbclient | SMB share access | `sudo apt install smbclient` |
+| snmpwalk | SNMP enumeration | `sudo apt install snmp` |
+| snmp-check | SNMP dump | `sudo apt install snmp-check` |
+| crackmapexec | SMB fingerprinting | `sudo apt install crackmapexec` |
+| dig | DNS queries | `sudo apt install dnsutils` |
+| ldapsearch | LDAP queries | `sudo apt install ldap-utils` |
 
-**Optional (standard Kali install):** gobuster, whatweb, enum4linux-ng (or enum4linux), snmpwalk, snmp-check, smbclient, rpcclient, dig, nikto, ldapsearch, crackmapexec (or netexec), curl
+---
+
+## Pairs With
+
+```bash
+# Feed nmap results into exploit finder
+xfind nmap ./recon/10.10.10.5/nmap/quick_tcp.txt
+
+# Deep web enum on HTTP ports
+webrecon http://10.10.10.5
+
+# Low-hanging fruit check
+fruitpicker 10.10.10.5
+
+# Test web input points found by gobuster
+webtester sqli -u "http://10.10.10.5/login.php" --param user -m POST
+```
 
 ---
 
