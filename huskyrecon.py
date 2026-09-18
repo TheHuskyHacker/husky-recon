@@ -6,9 +6,9 @@ Takes a target IP, runs the full nmap → web → SMB → SNMP → FTP → DNS
 dance in parallel, organizes output into clean folders, and flags
 quick wins at the end.
 
-Requires: nmap, gobuster, whatweb, enum4linux-ng, snmpwalk,
+Requires: python-nmap (pip install python-nmap), nmap installed.
+Optional: gobuster, whatweb, enum4linux-ng, snmpwalk,
           smbclient, dig, ftp (standard Kali install).
-          All optional — skips gracefully if a tool is missing.
 """
 
 import argparse
@@ -23,6 +23,12 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+
+try:
+    import nmap as pynmap
+except ImportError:
+    print("[!] python-nmap not installed. Run: pip install python-nmap")
+    sys.exit(1)
 
 # ───────────────── ANSI helpers ───────────────────────────
 
@@ -83,6 +89,11 @@ def tool_exists(name):
 def run_cmd(cmd, outfile=None, timeout=None):
     """Run a command, optionally save output, return (returncode, stdout)."""
     try:
+        # Create output directory BEFORE the command runs
+        # (nmap -oN needs the dir to exist)
+        if outfile:
+            Path(outfile).parent.mkdir(parents=True, exist_ok=True)
+
         proc = subprocess.Popen(
             cmd, shell=True,
             stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
@@ -99,7 +110,6 @@ def run_cmd(cmd, outfile=None, timeout=None):
                 RUNNING_PROCS.remove(proc)
 
         if outfile:
-            Path(outfile).parent.mkdir(parents=True, exist_ok=True)
             with open(outfile, "w") as f:
                 f.write(output)
 
@@ -133,45 +143,109 @@ def parse_nmap_ports(nmap_output):
 
 
 # ═══════════════════════════════════════════════════════════
-#                    SCAN MODULES
+#                    SCAN MODULES (python-nmap)
 # ═══════════════════════════════════════════════════════════
 
-def nmap_quick(target, outdir):
-    """Quick TCP scan — top 1000 ports to get started fast."""
-    log("[*]", f"Nmap quick TCP scan starting...", cyan)
-    outfile = f"{outdir}/nmap/quick_tcp.txt"
-    cmd = f"nmap -sC -sV -T4 --open -oN {outfile} {target}"
-    rc, output = run_cmd(cmd, timeout=300)
+def _pynmap_to_ports(nm):
+    """Convert python-nmap result to our ports dict and save readable output."""
+    ports = {}
+    lines = []
+    for host in nm.all_hosts():
+        for proto in nm[host].all_protocols():
+            for port in sorted(nm[host][proto].keys()):
+                entry = nm[host][proto][port]
+                if entry.get("state") == "open":
+                    product = entry.get("product", "")
+                    version = entry.get("version", "")
+                    extrainfo = entry.get("extrainfo", "")
+                    ver_str = " ".join(x for x in [product, version, extrainfo] if x).strip()
+                    ports[port] = {
+                        "proto": proto,
+                        "service": entry.get("name", "unknown"),
+                        "version": ver_str,
+                    }
+                    lines.append(f"{port}/{proto}  open  {entry.get('name','')}  {ver_str}")
+    return ports, "\n".join(lines)
 
-    ports = parse_nmap_ports(output)
+
+def _save_nmap_output(nm, outfile):
+    """Save readable nmap results to file."""
+    Path(outfile).parent.mkdir(parents=True, exist_ok=True)
+    lines = []
+    lines.append(f"# Nmap scan - {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    lines.append(f"# Command: {nm.command_line()}")
+    lines.append("")
+    for host in nm.all_hosts():
+        lines.append(f"Host: {host} ({nm[host].hostname()})")
+        lines.append(f"State: {nm[host].state()}")
+        for proto in nm[host].all_protocols():
+            lines.append(f"\nProtocol: {proto}")
+            lines.append(f"{'PORT':<10} {'STATE':<10} {'SERVICE':<15} {'VERSION'}")
+            for port in sorted(nm[host][proto].keys()):
+                e = nm[host][proto][port]
+                product = e.get("product", "")
+                version = e.get("version", "")
+                extrainfo = e.get("extrainfo", "")
+                ver_str = " ".join(x for x in [product, version, extrainfo] if x).strip()
+                lines.append(f"{port:<10} {e['state']:<10} {e.get('name',''):<15} {ver_str}")
+    with open(outfile, "w") as f:
+        f.write("\n".join(lines) + "\n")
+
+
+def nmap_quick(target, outdir):
+    """Full TCP scan - all 65535 ports with service detection using python-nmap."""
+    log("[*]", f"Nmap full TCP scan starting (-p- --min-rate 1000)...", cyan)
+    outfile = f"{outdir}/nmap/quick_tcp.txt"
+
+    nm = pynmap.PortScanner()
+    try:
+        nm.scan(hosts=target, ports="1-65535",
+                arguments="-sC -sV -Pn --open --min-rate 1000")
+    except pynmap.PortScannerError as e:
+        log("[!]", f"Nmap error: {e}", red)
+        if "requires root" in str(e).lower():
+            log("[*]", "Run with sudo for SYN scan", yellow)
+        return {}
+    except Exception as e:
+        log("[!]", f"Scan failed: {e}", red)
+        return {}
+
+    ports, _ = _pynmap_to_ports(nm)
+    _save_nmap_output(nm, outfile)
+
     if ports:
         for port, info in sorted(ports.items()):
             svc = info["service"]
             ver = info["version"]
             log("[+]", f"Port {green(str(port))}/{info['proto']} — {bold(svc)} {dim(ver)}")
 
-            # Flag known quick wins
             if svc == "ftp" and "Anonymous" in ver:
                 win(f"FTP Anonymous access on port {port}")
             if "Apache" in ver or "nginx" in ver or "IIS" in ver:
                 if re.search(r"[\d.]+", ver):
                     log("[*]", f"Web server version exposed: {ver}", yellow)
     else:
-        log("[-]", "No open ports found in quick scan", red)
+        log("[-]", "No open ports found in scan", red)
 
-    log("[+]", f"Quick scan done — {len(ports)} ports → {dim(outfile)}", green)
+    log("[+]", f"Scan done — {len(ports)} ports → {dim(outfile)}", green)
     return ports
 
 
 def nmap_full_tcp(target, outdir):
-    """Full TCP port scan — all 65535."""
+    """Full TCP port scan - all 65535 (background, no scripts)."""
     log("[*]", "Nmap full TCP scan (all ports, background)...", cyan)
     outfile = f"{outdir}/nmap/full_tcp.txt"
-    cmd = f"nmap -p- -T4 --open --min-rate 1000 -oN {outfile} {target}"
-    rc, output = run_cmd(cmd, timeout=900)
 
-    ports = parse_nmap_ports(output)
-    # Find new ports not in quick scan
+    nm = pynmap.PortScanner()
+    try:
+        nm.scan(hosts=target, ports="1-65535",
+                arguments="-Pn --open --min-rate 1000")
+    except Exception as e:
+        log("[!]", f"Full scan error: {e}", red)
+        return {}
+
+    ports, _ = _pynmap_to_ports(nm)
+    _save_nmap_output(nm, outfile)
     log("[+]", f"Full TCP done — {len(ports)} ports → {dim(outfile)}", green)
     return ports
 
@@ -180,10 +254,17 @@ def nmap_udp(target, outdir):
     """Top UDP ports scan."""
     log("[*]", "Nmap UDP scan (top 50)...", cyan)
     outfile = f"{outdir}/nmap/udp.txt"
-    cmd = f"nmap -sU --top-ports 50 -T4 --open -oN {outfile} {target}"
-    rc, output = run_cmd(cmd, timeout=600)
 
-    ports = parse_nmap_ports(output)
+    nm = pynmap.PortScanner()
+    try:
+        nm.scan(hosts=target, arguments="-Pn -sU --top-ports 50 --open")
+    except Exception as e:
+        log("[!]", f"UDP scan error: {e}", red)
+        return {}
+
+    ports, _ = _pynmap_to_ports(nm)
+    _save_nmap_output(nm, outfile)
+
     for port, info in sorted(ports.items()):
         log("[+]", f"UDP {green(str(port))} — {bold(info['service'])} {dim(info['version'])}")
         if info["service"] == "snmp":
@@ -196,15 +277,27 @@ def nmap_vuln(target, outdir, ports_str):
     """Run nmap vuln scripts against discovered ports."""
     log("[*]", "Nmap vulnerability scripts...", cyan)
     outfile = f"{outdir}/nmap/vuln.txt"
-    cmd = f"nmap -p {ports_str} --script vuln -T4 -oN {outfile} {target}"
-    rc, output = run_cmd(cmd, timeout=600)
 
-    # Check for notable findings
-    for line in output.split("\n"):
-        if "VULNERABLE" in line or "CVE-" in line:
-            clean = line.strip().lstrip("|").strip()
-            if clean:
-                win(f"Vuln script hit: {clean}")
+    nm = pynmap.PortScanner()
+    try:
+        nm.scan(hosts=target, ports=ports_str,
+                arguments="-Pn --script vuln")
+    except Exception as e:
+        log("[!]", f"Vuln scan error: {e}", red)
+        return
+
+    # Save output
+    _save_nmap_output(nm, outfile)
+
+    # Check for vuln findings in script output
+    for host in nm.all_hosts():
+        for proto in nm[host].all_protocols():
+            for port in nm[host][proto].keys():
+                entry = nm[host][proto][port]
+                if "script" in entry:
+                    for script_name, script_output in entry["script"].items():
+                        if "VULNERABLE" in script_output or "CVE-" in script_output:
+                            win(f"Vuln on {port}: {script_name}")
 
     log("[+]", f"Vuln scripts done → {dim(outfile)}", green)
 
@@ -533,10 +626,23 @@ def run_recon(args):
     log("═══", bold("PHASE 1: Port Discovery"), cyan)
     ports = nmap_quick(target, outdir)
 
-    if not ports and not args.force:
-        log("[!]", "No open ports found — target may be down or fully filtered", red)
-        log("[*]", "Use --force to continue with full scans anyway", dim)
-        return
+    if not ports:
+        log("[!]", "Quick scan found no open ports on top 1000", yellow)
+        log("[*]", "Running full 65535 port scan — services may be on non-standard ports...", cyan)
+
+        # Run full scan immediately (not background) and use those results
+        full_ports = nmap_full_tcp(target, outdir)
+        if full_ports:
+            ports = full_ports
+            log("[+]", f"Full scan found {len(ports)} port(s)!", green)
+            for port, info in sorted(ports.items()):
+                svc = info["service"]
+                ver = info["version"]
+                log("[+]", f"Port {port}/{info['proto']} — {svc} {ver}")
+        else:
+            log("[!]", "Full scan also found nothing — target may be down or fully filtered", red)
+            if not args.force:
+                return
 
     # Kick off full TCP + UDP in background
     background = []
